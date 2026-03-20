@@ -1,4 +1,6 @@
-import { PrivateKey, Transaction, P2PKH, Teranode } from '@bsv/sdk'
+import { PrivateKey, Transaction, P2PKH, NodejsHttpClient } from '@bsv/sdk'
+import https from 'node:https'
+import ArcadeBroadcater from './Arcade.js'
 
 export interface SpendOptions {
   wif: string
@@ -29,8 +31,11 @@ export async function spendCoinbase(opts: SpendOptions) {
   await tx.fee(opts.fee ?? 100)
   await tx.sign()
 
-  const teranode = new Teranode(opts.broadcastEndpoint)
-  const result = await tx.broadcast(teranode)
+  const arcade = new ArcadeBroadcater(opts.broadcastEndpoint, {
+    httpClient: new NodejsHttpClient(https)
+  })
+
+  const result = await arcade.broadcast(tx)
 
   return { tx, result }
 }
