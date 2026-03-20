@@ -16,12 +16,16 @@ program
   .requiredOption('-e, --endpoint <url>', 'Teranode broadcast endpoint')
   .requiredOption('-t, --tx <hex>', 'Coinbase transaction hex')
   .requiredOption('-w, --wif <key>', 'Private key in WIF format')
+  .option('-a, --arcade-endpoint <url>', 'Arcade broadcast endpoint (overrides Teranode for broadcast)')
   .option('-i, --index <number>', 'Source output index', '0')
   .option('-f, --fee <sats>', 'Transaction fee in satoshis', '100')
   .action(async (opts) => {
     console.log(banner)
 
-    console.log(chalk.dim('  Endpoint:'), chalk.yellow(opts.endpoint))
+    console.log(chalk.dim('  Teranode:'), chalk.yellow(opts.endpoint))
+    if (opts.arcadeEndpoint) {
+      console.log(chalk.dim('  Arcade:  '), chalk.yellow(opts.arcadeEndpoint))
+    }
     console.log(chalk.dim('  Tx hex:  '), chalk.yellow(opts.tx.slice(0, 16) + '...'))
     console.log(chalk.dim('  Output:  '), chalk.yellow(opts.index))
     console.log(chalk.dim('  Fee:     '), chalk.yellow(`${opts.fee} sats`))
@@ -38,6 +42,7 @@ program
         wif: opts.wif,
         coinbaseTxHex: opts.tx,
         broadcastEndpoint: opts.endpoint,
+        arcadeEndpoint: opts.arcadeEndpoint,
         outputIndex: parseInt(opts.index),
         fee: parseInt(opts.fee),
       })

@@ -21,6 +21,7 @@
   "dependencies": {
     "@bsv/sdk": "^2.0.12",
     "chalk": "^5.4.1",
+    "coinbase-spend": "^1.0.0",
     "commander": "^13.1.0"
   },
   "devDependencies": {

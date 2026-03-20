@@ -1,9 +1,11 @@
 import { PrivateKey, Transaction, P2PKH, Teranode } from '@bsv/sdk'
+import { ArcadeBroadcaster } from './arcade.js'
 
 export interface SpendOptions {
   wif: string
   coinbaseTxHex: string
   broadcastEndpoint: string
+  arcadeEndpoint?: string
   outputIndex?: number
   fee?: number
 }
@@ -29,8 +31,10 @@ export async function spendCoinbase(opts: SpendOptions) {
   await tx.fee(opts.fee ?? 100)
   await tx.sign()
 
-  const teranode = new Teranode(opts.broadcastEndpoint)
-  const result = await tx.broadcast(teranode)
+  const broadcaster = opts.arcadeEndpoint
+    ? new ArcadeBroadcaster(opts.arcadeEndpoint)
+    : new Teranode(opts.broadcastEndpoint)
+  const result = await tx.broadcast(broadcaster)
 
   return { tx, result }
 }
