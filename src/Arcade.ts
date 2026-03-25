@@ -118,7 +118,6 @@ export default class ArcadeBroadcater implements Broadcaster {
   ): Promise<BroadcastResponse | BroadcastFailure> {
     let rawTx
     try {
-      console.log({ ef: tx.toHexEF() })
       rawTx = tx.toHexEF()
     } catch (error: unknown) {
       if (
