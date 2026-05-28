@@ -1,4 +1,5 @@
 import { PrivateKey, Transaction, P2PKH, NodejsHttpClient } from '@bsv/sdk'
+import http from 'node:http'
 import https from 'node:https'
 import ArcadeBroadcater from './Arcade.js'
 
@@ -32,7 +33,7 @@ export async function spendCoinbase(opts: SpendOptions) {
   await tx.sign()
 
   const arcade = new ArcadeBroadcater(opts.broadcastEndpoint, {
-    httpClient: new NodejsHttpClient(https)
+    httpClient: new NodejsHttpClient(opts.broadcastEndpoint.startsWith('http://') ? http : https)
   })
 
   const result = await arcade.broadcast(tx)

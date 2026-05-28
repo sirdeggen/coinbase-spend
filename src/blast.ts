@@ -1,13 +1,15 @@
 import { PrivateKey, Transaction, P2PKH, Script, NodejsHttpClient } from '@bsv/sdk'
+import http from 'node:http'
 import https from 'node:https'
 import fs from 'node:fs'
 import readline from 'node:readline'
 import chalk from 'chalk'
 import ArcadeBroadcater from './Arcade.js'
 
-const LANE_COUNT = 2000
-const FEE_SATS = 1
-const BATCH_INTERVAL_MS = 100
+const DEFAULT_LANE_COUNT = 500
+const MAX_BATCH_SIZE = 1000
+const MAX_INFLIGHT = 3
+const MAX_QUEUE_DEPTH = 3
 const MAX_FAIL_COUNT = 3
 
 interface LaneTip {
@@ -16,6 +18,16 @@ interface LaneTip {
   satoshis: number
   failCount: number
   dead: boolean
+  generation: number
+}
+
+interface BatchEntry {
+  tx: Transaction
+  laneIdx: number
+  prevTx: Transaction
+  prevVout: number
+  prevSats: number
+  generation: number
 }
 
 export interface BlastOptions {
@@ -24,6 +36,7 @@ export interface BlastOptions {
   broadcastEndpoint: string
   outputIndex?: number
   rate: number
+  lanes?: number
   message?: string
   logPath: string
 }
@@ -37,30 +50,48 @@ function buildOpReturnScript(message?: string): Script {
     .writeBin([...data])
 }
 
+function isSuccessResult(result: any): boolean {
+  if (result.status === 'success') return true
+
+  const txStatus = (result.txStatus ?? '').toUpperCase()
+  const extraInfo = (result.extraInfo ?? '').toUpperCase()
+
+  const successStatuses = ['SEEN_ON_NETWORK', 'ACCEPTED_BY_NETWORK', 'MINED']
+  if (successStatuses.some(s => txStatus.includes(s))) return true
+
+  if (extraInfo.includes('BLOB_EXISTS') || extraInfo.includes('ALREADY_KNOWN')) return true
+  if (txStatus.includes('BLOB_EXISTS') || txStatus.includes('ALREADY_KNOWN')) return true
+
+  return false
+}
+
 export async function blast(opts: BlastOptions) {
   const key = PrivateKey.fromWif(opts.wif)
   const hash = key.toPublicKey().toHash() as number[]
   const p2pkh = new P2PKH()
-  const rate = opts.rate
+  const laneCount = opts.lanes ?? DEFAULT_LANE_COUNT
   const sourceTransaction = Transaction.fromHex(opts.coinbaseTxHex)
   const sourceOutputIndex = opts.outputIndex ?? 0
   const sourceValue = sourceTransaction.outputs[sourceOutputIndex].satoshis!
 
   const arcade = new ArcadeBroadcater(opts.broadcastEndpoint, {
-    httpClient: new NodejsHttpClient(https)
+    httpClient: new NodejsHttpClient(opts.broadcastEndpoint.startsWith('http://') ? http : https)
   })
 
   const logStream = fs.createWriteStream(opts.logPath, { flags: 'a' })
   const opReturnScript = buildOpReturnScript(opts.message)
 
+  // Detect zero-fee support
+  let feeSats = 0
+  let zeroFeeSupported = true
+
   // Stage 1: Fan-out transaction
-  console.log(chalk.dim(`  Building fan-out transaction (${LANE_COUNT} lanes)...`))
+  console.log(chalk.dim(`  Building fan-out transaction (${laneCount} lanes)...`))
 
-  const fanoutFee = FEE_SATS * LANE_COUNT
-  const perLaneSats = Math.floor((sourceValue - fanoutFee) / LANE_COUNT)
+  const perLaneSats = Math.floor(sourceValue / laneCount)
 
-  if (perLaneSats <= FEE_SATS) {
-    throw new Error(`Insufficient funds: ${sourceValue} sats cannot support ${LANE_COUNT} lanes after fees`)
+  if (perLaneSats <= 1) {
+    throw new Error(`Insufficient funds: ${sourceValue} sats cannot support ${laneCount} lanes`)
   }
 
   const fanoutTx = new Transaction()
@@ -70,14 +101,26 @@ export async function blast(opts: BlastOptions) {
     sourceOutputIndex,
   })
 
-  for (let i = 0; i < LANE_COUNT; i++) {
+  for (let i = 0; i < laneCount; i++) {
     fanoutTx.addOutput({
       lockingScript: p2pkh.lock(hash),
       satoshis: perLaneSats,
     })
   }
 
-  await fanoutTx.fee(fanoutFee)
+  // Try zero fee first
+  try {
+    await fanoutTx.fee(0)
+    zeroFeeSupported = true
+    feeSats = 0
+  } catch {
+    await fanoutTx.fee(1)
+    zeroFeeSupported = false
+    feeSats = 1
+    // Adjust last output to account for fee
+    fanoutTx.outputs[laneCount - 1].satoshis = perLaneSats - 1
+  }
+
   await fanoutTx.sign()
 
   console.log(chalk.dim('  Broadcasting fan-out transaction...'))
@@ -90,7 +133,8 @@ export async function blast(opts: BlastOptions) {
 
   const fanoutTxid = fanoutResult.txid
   console.log(`  ${chalk.green('✔')} Fan-out tx: ${chalk.yellow(fanoutTxid)}`)
-  console.log(`  ${chalk.dim(`  ${LANE_COUNT} lanes × ${perLaneSats} sats each`)}`)
+  console.log(`  ${chalk.dim(`  ${laneCount} lanes x ${perLaneSats} sats each`)}`)
+  console.log(`  ${chalk.dim(`  Fee mode: ${zeroFeeSupported ? 'zero-fee' : '1-sat fee'}`)}`)
   console.log()
 
   logStream.write(`# fan-out: ${fanoutTxid}\n`)
@@ -100,24 +144,34 @@ export async function blast(opts: BlastOptions) {
 
   // Initialize lanes
   const lanes: LaneTip[] = []
-  for (let i = 0; i < LANE_COUNT; i++) {
+  for (let i = 0; i < laneCount; i++) {
     lanes.push({
       tx: fanoutTx,
       vout: i,
-      satoshis: perLaneSats,
+      satoshis: i === laneCount - 1 && !zeroFeeSupported ? perLaneSats - 1 : perLaneSats,
       failCount: 0,
       dead: false,
+      generation: 0,
     })
   }
 
-  // Stage 2: Blast loop
+  // Stage 2: Producer-Consumer Pipeline
   let running = true
   let paused = false
   let currentLane = 0
   let txCount = 0
+  let failCount = 0
+  let networkErrorCount = 0
+  let deadLaneCount = 0
+  const startTime = Date.now()
   let lastSecondCount = 0
   let lastSecondTime = Date.now()
+  let targetRate = opts.rate
+  let inflightCount = 0
 
+  const queue: BatchEntry[][] = []
+
+  // --- Interactive controls ---
   const cleanupStdin = () => {
     process.stdin.removeListener('data', onKey)
     if (process.stdin.isTTY) {
@@ -158,9 +212,9 @@ export async function blast(opts: BlastOptions) {
     if (ch === 'p') {
       paused = !paused
       if (paused) {
-        console.log(chalk.cyan('  ⏸ Paused (press p to resume, r to change rate)'))
+        console.log(chalk.cyan('  Paused (press p to resume, r to change rate)'))
       } else {
-        console.log(chalk.cyan(`  ▶ Resumed at ${targetRate} tx/sec`))
+        console.log(chalk.cyan(`  Resumed at ${targetRate} tx/sec`))
       }
     } else if (ch === 'r' && paused) {
       promptRate()
@@ -183,13 +237,19 @@ export async function blast(opts: BlastOptions) {
     console.log(chalk.yellow('  Shutting down...'))
     console.log()
 
-    // Print lane tips for resumability
     let alive = 0
-    for (let i = 0; i < lanes.length; i++) {
-      const lane = lanes[i]
+    for (const lane of lanes) {
       if (!lane.dead) alive++
     }
-    console.log(chalk.dim(`  ${alive}/${LANE_COUNT} lanes alive, ${txCount} total transactions`))
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
+    console.log(chalk.dim(`  Summary:`))
+    console.log(chalk.dim(`    Successful txs:  ${txCount}`))
+    console.log(chalk.dim(`    Failed txs:      ${failCount}`))
+    console.log(chalk.dim(`    Network errors:  ${networkErrorCount}`))
+    console.log(chalk.dim(`    Dead lanes:      ${deadLaneCount}`))
+    console.log(chalk.dim(`    Lanes alive:     ${alive}/${laneCount}`))
+    console.log(chalk.dim(`    Elapsed:         ${elapsed}s`))
     console.log()
 
     for (let i = 0; i < lanes.length; i++) {
@@ -205,154 +265,241 @@ export async function blast(opts: BlastOptions) {
 
   process.on('SIGINT', shutdown)
 
-  let targetRate = rate
+  // --- Metrics ticker ---
+  const metricsInterval = setInterval(() => {
+    if (!running || paused) return
+    const now = Date.now()
+    const elapsed = (now - lastSecondTime) / 1000
+    if (elapsed < 0.5) return
+    const tps = Math.round((txCount - lastSecondCount) / elapsed)
+    const alive = lanes.filter(l => !l.dead).length
+    console.log(
+      chalk.dim(`  ${tps} tx/sec`) +
+      chalk.dim(' | ') +
+      chalk.dim(`total: ${txCount}`) +
+      chalk.dim(' | ') +
+      chalk.dim(`lanes: ${alive}/${laneCount}`) +
+      chalk.dim(' | ') +
+      chalk.dim(`queue: ${queue.length}`)
+    )
+    lastSecondCount = txCount
+    lastSecondTime = now
+  }, 1000)
 
-  while (running) {
-    const tickStart = Date.now()
-
-    if (paused) {
-      await new Promise(resolve => setTimeout(resolve, 100))
-      continue
-    }
-
-    // Compute batch size from current target rate (10 ticks/sec)
-    const batchSize = Math.ceil(targetRate / 10)
-
-    // Find batchSize transactions to build
-    const batch: { tx: Transaction; laneIdx: number; prevTx: Transaction; prevVout: number; prevSats: number }[] = []
-    let allExhausted = false
-
-    for (let b = 0; b < batchSize; b++) {
-      // Find next alive lane
-      let attempts = 0
-      while (attempts < LANE_COUNT) {
-        const lane = lanes[currentLane]
-        if (!lane.dead && lane.satoshis > FEE_SATS) break
-        currentLane = (currentLane + 1) % LANE_COUNT
-        attempts++
+  // --- Builder loop (producer) ---
+  const builderLoop = async () => {
+    while (running) {
+      if (paused) {
+        await sleep(100)
+        continue
       }
 
-      if (attempts >= LANE_COUNT) {
-        allExhausted = true
+      if (queue.length >= MAX_QUEUE_DEPTH) {
+        await sleep(10)
+        continue
+      }
+
+      const batchSize = Math.min(targetRate, MAX_BATCH_SIZE)
+      const batchesPerSecond = Math.ceil(targetRate / batchSize)
+      const batchIntervalMs = Math.floor(1000 / batchesPerSecond)
+      const tickStart = Date.now()
+
+      // Build a batch
+      const batch: BatchEntry[] = []
+      let scannedAll = false
+
+      for (let b = 0; b < batchSize; b++) {
+        // Find next alive lane
+        let attempts = 0
+        while (attempts < laneCount) {
+          const lane = lanes[currentLane]
+          if (!lane.dead && lane.satoshis > feeSats) break
+          currentLane = (currentLane + 1) % laneCount
+          attempts++
+        }
+
+        if (attempts >= laneCount) {
+          scannedAll = true
+          break
+        }
+
+        const lane = lanes[currentLane]
+        const laneIdx = currentLane
+        const prevTx = lane.tx
+        const prevVout = lane.vout
+        const prevSats = lane.satoshis
+        const gen = lane.generation
+
+        // Build transaction: OP_RETURN at output 0, P2PKH at output 1
+        const chainTx = new Transaction()
+        chainTx.addInput({
+          unlockingScriptTemplate: p2pkh.unlock(key),
+          sourceTransaction: lane.tx,
+          sourceOutputIndex: lane.vout,
+        })
+
+        chainTx.addOutput({
+          lockingScript: opReturnScript,
+          satoshis: 0,
+        })
+
+        const outputSats = lane.satoshis - feeSats
+        chainTx.addOutput({
+          lockingScript: p2pkh.lock(hash),
+          satoshis: outputSats,
+        })
+
+        // Optimistic lane tip update
+        lane.tx = chainTx
+        lane.vout = 1  // P2PKH is always at index 1
+        lane.satoshis = outputSats
+
+        batch.push({ tx: chainTx, laneIdx, prevTx, prevVout, prevSats, generation: gen })
+
+        currentLane = (currentLane + 1) % laneCount
+      }
+
+      if (scannedAll && batch.length === 0) {
+        console.log()
+        console.log(chalk.red('  All lanes exhausted or dead.'))
+        running = false
         break
       }
 
-      const lane = lanes[currentLane]
-      const laneIdx = currentLane
-      const prevTx = lane.tx
-      const prevVout = lane.vout
-      const prevSats = lane.satoshis
+      if (batch.length > 0) {
+        // Sign all transactions in parallel
+        // Fee is implicit from output amounts (input sats - output sats = feeSats)
+        await Promise.all(batch.map(b => b.tx.sign()))
 
-      const chainTx = new Transaction()
-      chainTx.addInput({
-        unlockingScriptTemplate: p2pkh.unlock(key),
-        sourceTransaction: lane.tx,
-        sourceOutputIndex: lane.vout,
-      })
+        queue.push(batch)
+      }
 
-      const outputSats = lane.satoshis - FEE_SATS
-      chainTx.addOutput({
-        lockingScript: p2pkh.lock(hash),
-        satoshis: outputSats,
-      })
-
-      chainTx.addOutput({
-        lockingScript: opReturnScript,
-        satoshis: 0,
-      })
-
-      // Optimistic update — advance lane tip before broadcast
-      lane.tx = chainTx
-      lane.vout = 0
-      lane.satoshis = outputSats
-
-      batch.push({ tx: chainTx, laneIdx, prevTx, prevVout, prevSats })
-
-      currentLane = (currentLane + 1) % LANE_COUNT
+      // Sleep for remainder of batch interval
+      const elapsed = Date.now() - tickStart
+      const sleepMs = Math.max(0, batchIntervalMs - elapsed)
+      if (sleepMs > 0) {
+        await sleep(sleepMs)
+      }
     }
+  }
 
-    if (allExhausted && batch.length === 0) {
-      console.log()
-      console.log(chalk.red('  All lanes exhausted or dead.'))
-      logStream.end()
-      cleanupStdin()
-      process.removeListener('SIGINT', shutdown)
-      return
+  // --- Broadcaster loop (consumer) ---
+  const broadcasterLoop = async () => {
+    while (running || queue.length > 0) {
+      if (queue.length === 0 || inflightCount >= MAX_INFLIGHT) {
+        await sleep(5)
+        continue
+      }
+
+      const batch = queue.shift()!
+      inflightCount++
+
+      // Fire and process — don't await inline so we can have multiple in-flight
+      broadcastBatch(batch).finally(() => {
+        inflightCount--
+      })
     }
+  }
 
-    // Sign all transactions in parallel
-    await Promise.all(batch.map(b => b.tx.sign()))
+  const describeError = (result: any): string => {
+    return result.description || result.txStatus || result.extraInfo || 'unknown error'
+  }
 
-    // Batch broadcast
+  const broadcastBatch = async (batch: BatchEntry[]) => {
     try {
       const results = await arcade.broadcastMany(batch.map(b => b.tx))
 
-      for (let i = 0; i < results.length; i++) {
-        const result = results[i] as { status?: string; txid?: string; description?: string }
+      let batchOk = 0
+      let batchFail = 0
+      const errorDescs = new Set<string>()
+
+      for (let i = 0; i < batch.length; i++) {
         const b = batch[i]
+        const result = (results[i] ?? { status: 'error', description: 'missing result' }) as any
         const lane = lanes[b.laneIdx]
 
-        if (result.status === 'success') {
+        // Skip stale entries (lane was rolled back since this batch was built)
+        if (lane.generation !== b.generation) continue
+
+        if (isSuccessResult(result)) {
           txCount++
+          batchOk++
           lane.failCount = 0
-          // Null out sourceTransaction on the prev tx to free memory
+          // Free memory: cache the txid so the SDK no longer needs the
+          // full sourceTransaction object for serialization (hash()).
           const input = b.tx.inputs[0]
-          if (input) {
+          if (input?.sourceTransaction) {
+            input.sourceTXID = b.tx.inputs[0].sourceTransaction!.id('hex')
             input.sourceTransaction = undefined
           }
           if (result.txid) {
             logStream.write(result.txid + '\n')
           }
         } else {
+          const errDesc = describeError(result)
+          errorDescs.add(errDesc)
+          failCount++
+          batchFail++
+
+          // Log failure to file
+          logStream.write(`${new Date().toISOString()} FAIL lane=${b.laneIdx} ${errDesc}\n`)
+
           // Rollback lane tip
           lane.tx = b.prevTx
           lane.vout = b.prevVout
           lane.satoshis = b.prevSats
           lane.failCount++
+          lane.generation++
 
           if (lane.failCount >= MAX_FAIL_COUNT) {
             lane.dead = true
+            deadLaneCount++
+            const lastTxid = b.prevTx.id('hex')
+            console.log(chalk.red(`  Lane ${b.laneIdx} died: ${errDesc} (last UTXO: ${lastTxid}:${b.prevVout})`))
           }
         }
       }
+
+      if (batchFail > 0) {
+        const errors = [...errorDescs].join(', ')
+        console.log(chalk.dim(`  Batch: ${batchOk} ok, ${batchFail} failed [${errors}]`))
+      }
     } catch (err: any) {
-      // Rollback all lanes in batch
+      // Network error — rollback all lanes in batch
+      let affectedCount = 0
       for (const b of batch) {
         const lane = lanes[b.laneIdx]
+        if (lane.generation !== b.generation) continue
+
+        affectedCount++
         lane.tx = b.prevTx
         lane.vout = b.prevVout
         lane.satoshis = b.prevSats
         lane.failCount++
+        lane.generation++
         if (lane.failCount >= MAX_FAIL_COUNT) {
           lane.dead = true
+          deadLaneCount++
         }
       }
-    }
-
-    // Metrics every second
-    const now = Date.now()
-    if (now - lastSecondTime >= 1000) {
-      const elapsed = (now - lastSecondTime) / 1000
-      const tps = Math.round((txCount - lastSecondCount) / elapsed)
-      const alive = lanes.filter(l => !l.dead && l.satoshis > FEE_SATS).length
-      console.log(
-        chalk.dim(`  ${tps} tx/sec`) +
-        chalk.dim(' | ') +
-        chalk.dim(`total: ${txCount}`) +
-        chalk.dim(' | ') +
-        chalk.dim(`lanes alive: ${alive}/${LANE_COUNT}`)
-      )
-      lastSecondCount = txCount
-      lastSecondTime = now
-    }
-
-    // Sleep for remainder of tick interval
-    const elapsed = Date.now() - tickStart
-    const sleepMs = Math.max(0, BATCH_INTERVAL_MS - elapsed)
-    if (sleepMs > 0) {
-      await new Promise(resolve => setTimeout(resolve, sleepMs))
+      networkErrorCount++
+      console.log(chalk.red(`  Network error: ${err.message ?? err} (${affectedCount} lanes affected)`))
     }
   }
 
+  // Run both loops concurrently
+  await Promise.all([builderLoop(), broadcasterLoop()])
+
+  clearInterval(metricsInterval)
   process.removeListener('SIGINT', shutdown)
+
+  // If we exited due to all lanes dead, clean up
+  if (!running) {
+    cleanupStdin()
+    logStream.end()
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
 }

@@ -116,12 +116,12 @@ export default class ArcadeBroadcater implements Broadcaster {
   async broadcast (
     tx: Transaction
   ): Promise<BroadcastResponse | BroadcastFailure> {
-    let rawTx
+    let rawTx: string
     try {
       rawTx = tx.toHexEF()
     } catch (error: unknown) {
       if (
-        typeof error === 'object' && error !== null && 'message' in error && 
+        typeof error === 'object' && error !== null && 'message' in error &&
         error.message ===
         'All inputs must have source transactions when serializing to EF format'
       ) {
@@ -143,10 +143,12 @@ export default class ArcadeBroadcater implements Broadcaster {
         requestOptions
       )
       if (response.ok) {
-        const { txid, extraInfo, txStatus, competingTxs } = response.data
+        const data = response.data ?? {} as any
+        // Server may return {"status": "submitted"} without a txid — compute locally
+        const txid = data.txid ?? tx.id('hex')
+        const status = data.status ?? data.txStatus ?? ''
+        const extraInfo = data.extraInfo ?? ''
 
-        // Check for error txStatus values that ARC returns with HTTP 200
-        // These should be treated as broadcast failures
         const errorStatuses = [
           'DOUBLE_SPEND_ATTEMPTED',
           'REJECTED',
@@ -155,59 +157,42 @@ export default class ArcadeBroadcater implements Broadcaster {
           'MINED_IN_STALE_BLOCK'
         ]
 
-        const isOrphan = extraInfo?.toUpperCase().includes('ORPHAN') ||
-          txStatus?.toUpperCase().includes('ORPHAN')
+        const upperStatus = status.toUpperCase()
+        const upperExtra = extraInfo.toUpperCase()
+        const isOrphan = upperExtra.includes('ORPHAN') || upperStatus.includes('ORPHAN')
 
-        if (errorStatuses.includes(txStatus?.toUpperCase()) || isOrphan) {
+        if (errorStatuses.includes(upperStatus) || isOrphan) {
           const failure: BroadcastFailure = {
             status: 'error',
-            code: txStatus ?? 'UNKNOWN',
+            code: status || 'UNKNOWN',
             txid,
-            description: `${txStatus ?? ''} ${extraInfo ?? ''}`.trim()
+            description: `${status} ${extraInfo}`.trim()
           }
-          if (competingTxs != null) {
-            failure.more = { competingTxs }
+          if (data.competingTxs != null) {
+            failure.more = { competingTxs: data.competingTxs }
           }
           return failure
         }
 
-        const broadcastRes: BroadcastResponse = {
+        return {
           status: 'success',
           txid,
-          message: `${txStatus} ${extraInfo}`
+          message: `${status} ${extraInfo}`.trim() || 'submitted'
         }
-        if (competingTxs != null) {
-          broadcastRes.competingTxs = competingTxs
-        }
-        return broadcastRes
       } else {
-        const st = typeof response.status
         const r: BroadcastFailure = {
           status: 'error',
-          code:
-            st === 'number' || st === 'string'
-              ? response.status.toString()
-              : 'ERR_UNKNOWN',
+          code: String(response.status ?? 'ERR_UNKNOWN'),
           description: 'Unknown error'
         }
-        let d = response.data
+        let d = response.data as any
         if (typeof d === 'string') {
-          try {
-            d = JSON.parse(response.data as string)
-          } catch {
-            // Intentionally left empty
-          }
+          try { d = JSON.parse(d) } catch { /* ignore */ }
         }
-        if (typeof d === 'object') {
-          if (d !== null) {
-            r.more = d
-          }
-          if ((d != null) && typeof (d as { txid: string }).txid === 'string') {
-            r.txid = (d as { txid: string }).txid
-          }
-          if ((d != null) && 'detail' in d && typeof (d as { detail: string }).detail === 'string') {
-            r.description = (d as { detail: string }).detail
-          }
+        if (d != null && typeof d === 'object') {
+          r.more = d
+          if (typeof d.error === 'string') r.description = d.error
+          else if (typeof d.detail === 'string') r.description = d.detail
         }
         return r
       }
@@ -224,55 +209,79 @@ export default class ArcadeBroadcater implements Broadcaster {
   }
 
   /**
-   * Broadcasts multiple transactions via ARC.
-   * Handles mixed responses where some transactions succeed and others fail.
+   * Broadcasts multiple transactions via ARC using concatenated raw bytes.
+   * The server expects application/octet-stream and returns {"submitted": N}.
+   * The first N transactions are treated as successful; the rest as failed.
    *
    * @param {Transaction[]} txs - Array of transactions to be broadcasted.
-   * @returns {Promise<Array<object>>} A promise that resolves to an array of objects.
+   * @returns {Promise<Array<object>>} Per-transaction result objects.
    */
   async broadcastMany (txs: Transaction[]): Promise<object[]> {
-    const rawTxs = txs.map((tx) => {
-      try {
-        return { rawTx: tx.toHexEF() }
-      } catch (error: unknown) {
-        if (
-          typeof error === 'object' && error !== null && 'message' in error && 
-          error.message ===
-          'All inputs must have source transactions when serializing to EF format'
-        ) {
-          return { rawTx: tx.toHex() }
-        }
-        throw error
-      }
-    })
+    // Serialize each tx to raw bytes and concatenate
+    const chunks: number[][] = txs.map(tx => tx.toEF())
+    let totalLen = 0
+    for (const c of chunks) totalLen += c.length
+    const body = Buffer.alloc(totalLen)
+    let offset = 0
+    for (const c of chunks) {
+      for (let j = 0; j < c.length; j++) body[offset++] = c[j]
+    }
 
-    const requestOptions: HttpClientRequestOptions = {
-      method: 'POST',
-      headers: this.requestHeaders(),
-      data: rawTxs
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/octet-stream',
+      'XDeployment-ID': this.deploymentId
+    }
+    if (this.apiKey != null && this.apiKey !== '') {
+      headers.Authorization = `Bearer ${this.apiKey}`
+    }
+    if (this.headers != null) {
+      for (const key in this.headers) {
+        headers[key] = this.headers[key]
+      }
     }
 
     try {
-      const response = await this.httpClient.request<object[]>(
-        `${this.URL}/txs`,
-        requestOptions
-      )
+      const response = await fetch(`${this.URL}/txs`, {
+        method: 'POST',
+        headers,
+        body
+      })
 
-      return response.data as object[]
+      const data = await response.json() as any
+
+      if (!response.ok) {
+        const desc = data.error ?? `HTTP ${response.status}`
+        const submitted = typeof data.parsed === 'number' ? data.parsed : 0
+        return txs.map((tx, i) =>
+          i < submitted
+            ? { status: 'success', txid: tx.id('hex') }
+            : { status: 'error', code: String(response.status), description: desc }
+        )
+      }
+
+      const submitted = typeof data.submitted === 'number' ? data.submitted : txs.length
+      return txs.map((tx, i) =>
+        i < submitted
+          ? { status: 'success', txid: tx.id('hex') }
+          : { status: 'error', code: 'NOT_SUBMITTED', description: 'transaction not submitted' }
+      )
     } catch (error: unknown) {
-      const errorResponse: BroadcastFailure = {
+      const desc = typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string'
+        ? error.message
+        : 'Internal Server Error'
+      return txs.map(() => ({
         status: 'error',
         code: '500',
-        description: typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string' ? error.message : 'Internal Server Error'
-      }
-      return txs.map(() => errorResponse)
+        description: desc
+      }))
     }
   }
 }
 
 interface ArcResponse {
-  txid: string
-  extraInfo: string
-  txStatus: string
+  status?: string
+  txid?: string
+  extraInfo?: string
+  txStatus?: string
   competingTxs?: string[]
 }
