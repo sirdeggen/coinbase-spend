@@ -127,8 +127,17 @@ export async function blast(opts: BlastOptions) {
   const fanoutResult = await arcade.broadcast(fanoutTx)
 
   if (fanoutResult.status !== 'success') {
+    // Dump the entire failure object — including the raw server response in
+    // `more` — so opaque errors like "transaction failed validation" surface
+    // their actual reason (mempool conflict, locking script, fee, etc.).
+    console.error(chalk.red('  Fan-out failure detail:'))
+    console.error(JSON.stringify(fanoutResult, null, 2))
+    console.error(chalk.dim('  Fan-out tx hex:'), fanoutTx.toHex())
+    try {
+      console.error(chalk.dim('  Fan-out tx EF: '), fanoutTx.toHexEF())
+    } catch { /* EF unavailable */ }
     const fail = fanoutResult as { description?: string }
-    throw new Error(`Fan-out broadcast failed: ${fail.description ?? 'unknown error'}`)
+    throw new Error(`Fan-out broadcast failed: ${fail.description ?? 'unknown error'} | full: ${JSON.stringify(fanoutResult)}`)
   }
 
   const fanoutTxid = fanoutResult.txid

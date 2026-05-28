@@ -162,14 +162,15 @@ export default class ArcadeBroadcater implements Broadcaster {
         const isOrphan = upperExtra.includes('ORPHAN') || upperStatus.includes('ORPHAN')
 
         if (errorStatuses.includes(upperStatus) || isOrphan) {
+          // Preserve the entire server response body so callers can see
+          // every diagnostic field Arcade returned (detail, conflictingTxs,
+          // mempool reasons, etc.) — not just status + extraInfo.
           const failure: BroadcastFailure = {
             status: 'error',
             code: status || 'UNKNOWN',
             txid,
-            description: `${status} ${extraInfo}`.trim()
-          }
-          if (data.competingTxs != null) {
-            failure.more = { competingTxs: data.competingTxs }
+            description: `${status} ${extraInfo}`.trim() || 'transaction failed validation',
+            more: { httpStatus: response.status, response: data }
           }
           return failure
         }
@@ -187,12 +188,15 @@ export default class ArcadeBroadcater implements Broadcaster {
         }
         let d = response.data as any
         if (typeof d === 'string') {
-          try { d = JSON.parse(d) } catch { /* ignore */ }
+          try { d = JSON.parse(d) } catch { /* keep as raw string in `more` */ }
         }
+        r.more = { httpStatus: response.status, response: d }
         if (d != null && typeof d === 'object') {
-          r.more = d
           if (typeof d.error === 'string') r.description = d.error
           else if (typeof d.detail === 'string') r.description = d.detail
+          else if (typeof d.title === 'string') r.description = d.title
+        } else if (typeof d === 'string' && d.length > 0) {
+          r.description = d
         }
         return r
       }
